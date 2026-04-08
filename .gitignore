@@ -137,3 +137,9 @@ dist
 # Vite logs files
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+# Project-specific reports
+eslint-report.json
+ts-report.txt
+*-report.json
+*-report.txt
