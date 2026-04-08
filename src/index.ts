@@ -24,8 +24,25 @@ interface DiagnosticResult {
   errors: string[];
   stdout: string;
   stderr: string;
-  exitCode: number | null;
+  exitCode: number;
   duration: number;
+}
+
+interface EslintJsonOutput {
+  filePath: string;
+  messages: Array<{
+    ruleId: string | null;
+    severity: number;
+    message: string;
+    line: number;
+    column: number;
+    nodeType: string;
+    messageId: string;
+  }>;
+  errorCount: number;
+  warningCount: number;
+  suppressedMessages: unknown[];
+  usedDeprecatedRules: unknown[];
 }
 
 // ============================================================================
@@ -40,18 +57,55 @@ function log(message: string): void {
 }
 
 /**
+ * Parse ESLint JSON output and extract structured errors
+ */
+function parseEslintJson(stdout: string): { errors: string[]; errorCount: number; warningCount: number } {
+  const errors: string[] = [];
+  let totalErrorCount = 0;
+  let totalWarningCount = 0;
+
+  try {
+    const results: EslintJsonOutput[] = JSON.parse(stdout);
+
+    for (const fileResult of results) {
+      totalErrorCount += fileResult.errorCount;
+      totalWarningCount += fileResult.warningCount;
+
+      for (const msg of fileResult.messages) {
+        const location = `${fileResult.filePath}:${msg.line}:${msg.column}`;
+        const errorMsg = `[${msg.ruleId || 'unknown'}] ${msg.message} (${location})`;
+        errors.push(errorMsg);
+      }
+    }
+  } catch {
+    // If JSON parsing fails, fall back to raw output
+    const lines = stdout.split('\n');
+    for (const line of lines) {
+      if (line.includes('error') || /\d+\s+problem/.test(line)) {
+        errors.push(line.trim());
+      }
+    }
+  }
+
+  return { errors, errorCount: totalErrorCount, warningCount: totalWarningCount };
+}
+
+/**
  * Execute a shell command with timeout and return structured result.
  * Uses execa for safer child process management (no shell injection).
  */
 async function runCommand(
   command: string,
+  args: string[],
   cwd: string = WORKING_DIR
 ): Promise<DiagnosticResult> {
   const startTime = Date.now();
   const errors: string[] = [];
 
   try {
-    const { stdout, stderr, exitCode } = await execa(command, [], {
+    log(`Executing: ${command} ${args.join(' ')} in ${cwd}`);
+
+    const result = await execa(command, args, {
       cwd,
       timeout: TIMEOUT_MS,
       maxBuffer: 10 * 1024 * 1024, // 10MB buffer
@@ -60,78 +114,86 @@ async function runCommand(
     });
 
     const duration = Date.now() - startTime;
+    const stdout = result.stdout || '';
+    const stderr = result.stderr || '';
+    const exitCode = result.exitCode ?? 0;
 
-    // Parse ESLint errors from stdout if present
-    if (stdout.includes("error") || stdout.includes("warning")) {
-      const lines = stdout.split("\n");
+    log(`Command finished with exitCode: ${exitCode}, stdout length: ${stdout.length}, stderr length: ${stderr.length}`);
+
+    // Parse ESLint errors from JSON output
+    if (command === 'npx' && args[0] === 'eslint') {
+      const parsed = parseEslintJson(stdout);
+      errors.push(...parsed.errors);
+
+      // ESLint exitCode: 0 = no errors, 1 = has errors, 2 = fatal error
+      const success = exitCode === 0;
+
+      return {
+        success,
+        errors,
+        stdout: stdout.slice(0, 100_000), // Limit output size
+        stderr: stderr.slice(0, 10_000),
+        exitCode,
+        duration,
+      };
+    }
+
+    // For other commands (tsc, etc.)
+    const success = exitCode === 0;
+
+    // Parse errors from stderr/stdout for type checking
+    if (!success && (stderr || stdout)) {
+      const output = stderr || stdout;
+      const lines = output.split('\n');
       for (const line of lines) {
-        if (line.includes("error") || /\d+\s+problem/.test(line)) {
+        if (line.trim() && (line.includes('error') || line.includes('Error'))) {
           errors.push(line.trim());
         }
       }
     }
 
     return {
-      success: exitCode === 0,
+      success,
       errors,
-      stdout: stdout.slice(0, 50_000), // Limit output size
+      stdout: stdout.slice(0, 100_000),
       stderr: stderr.slice(0, 10_000),
-      exitCode: exitCode ?? null,
+      exitCode,
       duration,
     };
   } catch (error: unknown) {
     const duration = Date.now() - startTime;
 
     // execa throws ExecylaError on timeout / SIGTERM
-    if (error instanceof Error && "timedOut" in error) {
+    if (error instanceof Error && 'timedOut' in error) {
       return {
         success: false,
         errors: [`Command timed out after ${TIMEOUT_MS / 1000} seconds`],
-        stdout: "",
+        stdout: '',
         stderr: String(error),
-        exitCode: null,
+        exitCode: 124, // Standard timeout exit code
         duration,
       };
     }
 
-    if (error instanceof Error && "signal" in error) {
+    if (error instanceof Error && 'signal' in error) {
       return {
         success: false,
-        errors: ["Command was terminated"],
-        stdout: "",
+        errors: ['Command was terminated by signal'],
+        stdout: '',
         stderr: String(error),
-        exitCode: null,
+        exitCode: 143, // Standard SIGTERM exit code
         duration,
       };
     }
 
-    // Non-zero exit without timeout — parse structured fields if available
-    const execaError = error as {
-      stdout?: string;
-      stderr?: string;
-      exitCode?: number;
-      shortMessage?: string;
-    };
-
-    const stdout = execaError.stdout || "";
-    const stderr = execaError.stderr || "";
-    const exitCode = execaError.exitCode ?? null;
-
-    if (exitCode === 1 && stdout) {
-      const lines = stdout.split("\n");
-      for (const line of lines) {
-        if (line.includes("error") || /\d+\s+problem/.test(line)) {
-          errors.push(line.trim());
-        }
-      }
-    }
-
+    // Handle other errors
+    const errorMessage = error instanceof Error ? error.message : String(error);
     return {
       success: false,
-      errors: errors.length > 0 ? errors : [execaError.shortMessage?.slice(0, 500) ?? String(error).slice(0, 500)],
-      stdout: stdout.slice(0, 50_000),
-      stderr: stderr.slice(0, 10_000),
-      exitCode,
+      errors: [errorMessage.slice(0, 500)],
+      stdout: '',
+      stderr: errorMessage,
+      exitCode: 1,
       duration,
     };
   }
@@ -194,14 +256,14 @@ server.registerTool(
     title: "Run ESLint",
     description: `Run ESLint to find and report code quality issues.
 
-Runs "npx eslint ." in the specified directory to analyze JavaScript/TypeScript files.
+Runs "npx eslint src/ --format json" in the specified directory to analyze JavaScript/TypeScript files.
 
 Returns structured JSON with:
 - success: boolean indicating if linting completed without errors
 - errors: array of error/warning messages found
-- stdout: full ESLint output
+- stdout: full ESLint JSON output
 - stderr: any error output from ESLint
-- exitCode: the process exit code
+- exitCode: the process exit code (0=no errors, 1=has errors)
 - duration: time taken in milliseconds
 
 Use this to:
@@ -219,14 +281,16 @@ Use this to:
   async (params: z.infer<typeof LintInputSchema>) => {
     log(`Running ESLint in ${params.cwd}`);
 
-    const result = await runCommand("npx eslint . --format json", params.cwd);
+    const result = await runCommand('npx', ['eslint', 'src/', '--format', 'json'], params.cwd);
 
     const output = {
       tool: "lint",
-      command: "npx eslint . --format json",
+      command: "npx eslint src/ --format json",
       workingDirectory: params.cwd,
       ...result,
     };
+
+    log(`Lint result: success=${result.success}, exitCode=${result.exitCode}, errorCount=${result.errors.length}`);
 
     return {
       content: [{ type: "text", text: JSON.stringify(output, null, 2) }],
@@ -245,7 +309,7 @@ server.registerTool(
     title: "Fix ESLint Errors",
     description: `Run ESLint with automatic fixes to resolve code quality issues.
 
-Runs "npx eslint . --fix" to automatically fix fixable issues like:
+Runs "npx eslint src/ --fix --format json" to automatically fix fixable issues like:
 - Formatting problems
 - Missing semicolons
 - Unused variables (with underscore prefix)
@@ -255,9 +319,9 @@ Runs "npx eslint . --fix" to automatically fix fixable issues like:
 Note: Some errors require manual intervention.
 
 Returns structured JSON with:
-- success: boolean indicating if fixing completed
+- success: boolean indicating if fixing completed (exitCode 0)
 - errors: any remaining errors that could not be auto-fixed
-- stdout: ESLint output showing what was fixed
+- stdout: ESLint JSON output showing what was fixed
 - stderr: any error output
 - exitCode: the process exit code
 - duration: time taken in milliseconds`,
@@ -272,13 +336,13 @@ Returns structured JSON with:
   async (params: z.infer<typeof FixInputSchema>) => {
     log(`Running ESLint with --fix in ${params.cwd}`);
 
-    const result = await runCommand("npx eslint . --fix --format json", params.cwd);
+    const result = await runCommand('npx', ['eslint', 'src/', '--fix', '--format', 'json'], params.cwd);
 
     const output = {
       tool: "lint_fix",
-      command: "npx eslint . --fix",
+      command: "npx eslint src/ --fix",
       workingDirectory: params.cwd,
-      lintFixed: result.success && result.stdout.includes("fixed"),
+      lintFixed: result.exitCode === 0,
       ...result,
     };
 
@@ -324,7 +388,7 @@ Use this to:
   async (params: z.infer<typeof TypecheckInputSchema>) => {
     log(`Running TypeScript type check in ${params.cwd}`);
 
-    const result = await runCommand("npx tsc --noEmit", params.cwd);
+    const result = await runCommand('npx', ['tsc', '--noEmit'], params.cwd);
 
     const output = {
       tool: "typecheck",
@@ -350,7 +414,7 @@ server.registerTool(
     title: "Fix ESLint and TypeScript Errors",
     description: `Run ESLint fix and TypeScript type check sequentially.
 
-First runs "npx eslint . --fix" to auto-fix linting issues, then runs "npx tsc --noEmit" to check types.
+First runs "npx eslint src/ --fix" to auto-fix linting issues, then runs "npx tsc --noEmit" to check types.
 
 This is a convenience tool that combines lint_fix and typecheck in one call.
 The sequential execution ensures:
@@ -360,11 +424,7 @@ The sequential execution ensures:
 Returns structured JSON with:
 - lintResult: result from ESLint fix
 - typecheckResult: result from TypeScript check
-- totalDuration: combined time for both operations
-
-Use this to:
-- Comprehensive cleanup before commits
-- Fix all auto-fixable issues and identify remaining type errors`,
+- totalDuration: combined time for both operations`,
     inputSchema: FixAllInputSchema,
     annotations: {
       readOnlyHint: false,
@@ -378,34 +438,28 @@ Use this to:
 
     // Step 1: Run ESLint fix
     const startTime = Date.now();
-    const lintResult = await runCommand(
-      "npx eslint . --fix --format json",
-      params.cwd
-    );
+    const lintResult = await runCommand('npx', ['eslint', 'src/', '--fix', '--format', 'json'], params.cwd);
 
     // Step 2: Run TypeScript type check
-    const typecheckResult = await runCommand(
-      "npx tsc --noEmit",
-      params.cwd
-    );
+    const typecheckResult = await runCommand('npx', ['tsc', '--noEmit'], params.cwd);
 
     const totalDuration = Date.now() - startTime;
 
     const output = {
       tool: "fix_all",
-      commands: ["npx eslint . --fix", "npx tsc --noEmit"],
+      commands: ["npx eslint src/ --fix", "npx tsc --noEmit"],
       workingDirectory: params.cwd,
       lintResult: {
-        success: lintResult.success,
+        success: lintResult.exitCode === 0,
         errors: lintResult.errors,
         stdout: lintResult.stdout,
         stderr: lintResult.stderr,
         exitCode: lintResult.exitCode,
         duration: lintResult.duration,
-        lintFixed: lintResult.success && lintResult.stdout.includes("fixed"),
+        lintFixed: lintResult.exitCode === 0,
       },
       typecheckResult: {
-        success: typecheckResult.success,
+        success: typecheckResult.exitCode === 0,
         errors: typecheckResult.errors,
         stdout: typecheckResult.stdout,
         stderr: typecheckResult.stderr,
@@ -414,9 +468,9 @@ Use this to:
       },
       totalDuration,
       summary: {
-        lintFixed: lintResult.success,
-        typecheckPassed: typecheckResult.success,
-        hasErrors: !lintResult.success || !typecheckResult.success,
+        lintFixed: lintResult.exitCode === 0,
+        typecheckPassed: typecheckResult.exitCode === 0,
+        hasErrors: lintResult.exitCode !== 0 || typecheckResult.exitCode !== 0,
       },
     };
 
