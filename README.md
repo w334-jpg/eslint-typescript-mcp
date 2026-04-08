@@ -1,5 +1,12 @@
 # ⚡ ESLint & TypeScript MCP Server
 
+<p align="center">
+  <img src="https://img.shields.io/npm/v/eslint-typescript-mcp" />
+  <img src="https://img.shields.io/github/stars/w334-jpg/eslint-typescript-mcp?style=social" />
+  <img src="https://img.shields.io/github/license/w334-jpg/eslint-typescript-mcp" />
+  <img src="https://img.shields.io/badge/MCP-ready-blue" />
+  <img src="https://img.shields.io/badge/AI-Claude%20Code-purple" />
+</p>
 > Let Claude automatically lint, fix, and type-check your entire codebase.
 
 The missing bridge between AI coding assistants and real-world code quality tools.
