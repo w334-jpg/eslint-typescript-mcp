@@ -1,6 +1,6 @@
 {
   "name": "eslint-typescript-mcp",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "MCP server that brings ESLint and TypeScript type-checking diagnostics to Claude Code — enables LLMs to lint, fix, and type-check code automatically",
   "keywords": [
     "mcp",
