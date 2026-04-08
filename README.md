@@ -7,14 +7,13 @@
   <img src="https://img.shields.io/badge/MCP-ready-blue" />
   <img src="https://img.shields.io/badge/AI-Claude%20Code-purple" />
 </p>
-> Let Claude automatically lint, fix, and type-check your entire codebase.
+🚀 Turn your AI assistant into a real code reviewer
+⚡ One command → fix your entire codebase
 
-The missing bridge between AI coding assistants and real-world code quality tools.
-
----
+Let Claude lint, fix, and type-check your entire project automatically — using real ESLint + TypeScript, not guesses.
 
 🔥 Stop manually fixing lint errors
-🔥 Stop running `tsc` yourself
+🔥 Stop running tsc yourself
 🔥 Let Claude do it for you
 
 ---
@@ -46,18 +45,18 @@ This MCP server gives Claude those capabilities.
 
 ## 🤖 Example (with Claude Code)
 
-Just tell Claude:
+You:
 
-Fix all lint and TypeScript errors in this project
+Fix all lint and TypeScript errors
 
-Claude will:
+Claude:
 
-1. Run ESLint
-2. Apply automatic fixes
-3. Run TypeScript type-checking
-4. Return structured results
+✔ Running ESLint...
+✔ Auto-fixing issues...
+✔ Running TypeScript...
+✔ 0 errors remaining
 
-No manual commands needed.
+🎉 Your codebase is now clean.
 
 ---
 
