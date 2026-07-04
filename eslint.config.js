@@ -8,15 +8,13 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 export default tseslint.config(
-  {                                                                                              
-    ignores: ['dist/**', 'node_modules/**', 'build/**'],                                           
-    files: ['src/**/*.ts'],                                                                      
-    // ... existing config
+  {
+    ignores: ['dist/**', 'node_modules/**', 'build/**', 'coverage/**'],
   },
   eslint.configs.recommended,
   ...tseslint.configs.recommended,
   {
-    files: ['src/**/*.ts'],
+    files: ['src/**/*.ts', 'tests/**/*.ts'],
     languageOptions: {
       parserOptions: {
         project: './tsconfig.json',
@@ -33,12 +31,24 @@ export default tseslint.config(
     },
   },
   {
-    files: ['*.config.js'],
+    files: ['tests/**/*.ts'],
+    languageOptions: {
+      globals: {
+        ...globals.node,
+      },
+    },
+    rules: {
+      '@typescript-eslint/no-explicit-any': 'off',
+      '@typescript-eslint/no-non-null-assertion': 'off',
+    },
+  },
+  {
+    files: ['*.config.js', '*.config.ts'],
     languageOptions: {
       parserOptions: {
         project: null,
       },
       globals: globals.node,
     },
-  }
+  },
 );

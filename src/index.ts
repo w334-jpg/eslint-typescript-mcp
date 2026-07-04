@@ -1,497 +1,365 @@
 #!/usr/bin/env node
 /**
- * MCP Server for ESLint and TypeScript Diagnostics.
+ * MCP server entry point.
  *
- * Provides tools to run ESLint and TypeScript type checking,
- * enabling LLMs to diagnose code issues and fix them automatically.
+ * Registers four tools (lint, lint_fix, typecheck, fix_all) that expose
+ * ESLint and TypeScript diagnostics to LLM clients. Each tool shares the
+ * same request lifecycle: validate cwd, normalize files, run the engine,
+ * and project the result into the MCP ToolResult contract.
  */
 
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { z } from "zod";
-import { execa } from "execa";
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { VERSION } from './config.js';
+import { runEslint } from './engines/eslint.js';
+import { runTsc } from './engines/tsc.js';
+import { logger } from './logger.js';
+import { normalizeFiles, validateCwd } from './paths.js';
+import {
+  countFixedFiles,
+  makeErrorResult,
+  pickFiles,
+  SECURITY_NOTE,
+  summarize,
+} from './result.js';
+import {
+  FixAllInputSchema,
+  LintFixInputSchema,
+  LintInputSchema,
+  ToolResultSchema,
+  TypecheckInputSchema,
+} from './schemas.js';
+import type { FileDiagnostic, ToolResult } from './types.js';
 
-// Constants
-const WORKING_DIR = process.cwd();
-const TIMEOUT_MS = 60_000; // 60 second timeout for commands
-
-// ============================================================================
-// Types
-// ============================================================================
-
-interface DiagnosticResult {
-  success: boolean;
-  errors: string[];
-  stdout: string;
-  stderr: string;
-  exitCode: number;
-  duration: number;
+interface BaseToolInput {
+  cwd?: string;
+  files?: string[];
+  format?: 'full' | 'compact';
 }
 
-interface EslintJsonOutput {
-  filePath: string;
-  messages: Array<{
-    ruleId: string | null;
-    severity: number;
-    message: string;
-    line: number;
-    column: number;
-    nodeType: string;
-    messageId: string;
-  }>;
-  errorCount: number;
-  warningCount: number;
-  suppressedMessages: unknown[];
-  usedDeprecatedRules: unknown[];
+interface McpToolResponse {
+  content: Array<{ type: 'text'; text: string }>;
+  structuredContent: ToolResult;
+  isError?: boolean;
+  [key: string]: unknown;
 }
 
-// ============================================================================
-// Utility Functions
-// ============================================================================
+function serialize(result: ToolResult): string {
+  return JSON.stringify(result, null, 2);
+}
+
+function resolveScope(input: BaseToolInput): { cwd: string; files: string[] | undefined } {
+  const cwd = validateCwd(input.cwd ?? process.cwd());
+  const files =
+    input.files && input.files.length > 0 ? normalizeFiles(input.files, cwd) : undefined;
+  return { cwd, files };
+}
 
 /**
- * Log a message to stderr (MCP protocol uses stderr for server logs)
+ * Wrap an engine invocation with cwd/files validation and uniform error
+ * handling. Any thrown Error becomes an `isError: true` MCP response while
+ * still returning a structured payload.
  */
-function log(message: string): void {
-  console.error(`[eslint-typescript-mcp] ${message}`);
-}
-
-/**
- * Parse ESLint JSON output and extract structured errors
- */
-function parseEslintJson(stdout: string): { errors: string[]; errorCount: number; warningCount: number } {
-  const errors: string[] = [];
-  let totalErrorCount = 0;
-  let totalWarningCount = 0;
-
+async function safeRun(params: {
+  tool: string;
+  input: BaseToolInput;
+  run: (cwd: string, files: string[] | undefined) => Promise<ToolResult>;
+}): Promise<McpToolResponse> {
   try {
-    const results: EslintJsonOutput[] = JSON.parse(stdout);
-
-    for (const fileResult of results) {
-      totalErrorCount += fileResult.errorCount;
-      totalWarningCount += fileResult.warningCount;
-
-      for (const msg of fileResult.messages) {
-        const location = `${fileResult.filePath}:${msg.line}:${msg.column}`;
-        const errorMsg = `[${msg.ruleId || 'unknown'}] ${msg.message} (${location})`;
-        errors.push(errorMsg);
-      }
-    }
-  } catch {
-    // If JSON parsing fails, fall back to raw output
-    const lines = stdout.split('\n');
-    for (const line of lines) {
-      if (line.includes('error') || /\d+\s+problem/.test(line)) {
-        errors.push(line.trim());
-      }
-    }
-  }
-
-  return { errors, errorCount: totalErrorCount, warningCount: totalWarningCount };
-}
-
-/**
- * Execute a shell command with timeout and return structured result.
- * Uses execa for safer child process management (no shell injection).
- */
-async function runCommand(
-  command: string,
-  args: string[],
-  cwd: string = WORKING_DIR
-): Promise<DiagnosticResult> {
-  const startTime = Date.now();
-  const errors: string[] = [];
-
-  try {
-    log(`Executing: ${command} ${args.join(' ')} in ${cwd}`);
-
-    const result = await execa(command, args, {
-      cwd,
-      timeout: TIMEOUT_MS,
-      maxBuffer: 10 * 1024 * 1024, // 10MB buffer
-      reject: false,
-      shell: false,
-    });
-
-    const duration = Date.now() - startTime;
-    const stdout = result.stdout || '';
-    const stderr = result.stderr || '';
-    const exitCode = result.exitCode ?? 0;
-
-    log(`Command finished with exitCode: ${exitCode}, stdout length: ${stdout.length}, stderr length: ${stderr.length}`);
-
-    // Parse ESLint errors from JSON output
-    if (command === 'npx' && args[0] === 'eslint') {
-      const parsed = parseEslintJson(stdout);
-      errors.push(...parsed.errors);
-
-      // ESLint exitCode: 0 = no errors, 1 = has errors, 2 = fatal error
-      const success = exitCode === 0;
-
-      return {
-        success,
-        errors,
-        stdout: stdout.slice(0, 100_000), // Limit output size
-        stderr: stderr.slice(0, 10_000),
-        exitCode,
-        duration,
-      };
-    }
-
-    // For other commands (tsc, etc.)
-    const success = exitCode === 0;
-
-    // Parse errors from stderr/stdout for type checking
-    if (!success && (stderr || stdout)) {
-      const output = stderr || stdout;
-      const lines = output.split('\n');
-      for (const line of lines) {
-        if (line.trim() && (line.includes('error') || line.includes('Error'))) {
-          errors.push(line.trim());
-        }
-      }
-    }
-
+    const { cwd, files } = resolveScope(params.input);
+    const result = await params.run(cwd, files);
     return {
-      success,
-      errors,
-      stdout: stdout.slice(0, 100_000),
-      stderr: stderr.slice(0, 10_000),
-      exitCode,
-      duration,
+      content: [{ type: 'text', text: serialize(result) }],
+      structuredContent: result,
     };
-  } catch (error: unknown) {
-    const duration = Date.now() - startTime;
-
-    // execa throws ExecylaError on timeout / SIGTERM
-    if (error instanceof Error && 'timedOut' in error) {
-      return {
-        success: false,
-        errors: [`Command timed out after ${TIMEOUT_MS / 1000} seconds`],
-        stdout: '',
-        stderr: String(error),
-        exitCode: 124, // Standard timeout exit code
-        duration,
-      };
-    }
-
-    if (error instanceof Error && 'signal' in error) {
-      return {
-        success: false,
-        errors: ['Command was terminated by signal'],
-        stdout: '',
-        stderr: String(error),
-        exitCode: 143, // Standard SIGTERM exit code
-        duration,
-      };
-    }
-
-    // Handle other errors
-    const errorMessage = error instanceof Error ? error.message : String(error);
+  } catch (error) {
+    const fallbackCwd = typeof params.input.cwd === 'string' ? params.input.cwd : process.cwd();
+    const result = makeErrorResult({ tool: params.tool, cwd: fallbackCwd, error });
     return {
-      success: false,
-      errors: [errorMessage.slice(0, 500)],
-      stdout: '',
-      stderr: errorMessage,
-      exitCode: 1,
-      duration,
+      content: [{ type: 'text', text: serialize(result) }],
+      structuredContent: result,
+      isError: true,
     };
   }
 }
-
-// ============================================================================
-// MCP Server Setup
-// ============================================================================
 
 const server = new McpServer({
-  name: "eslint-typescript-mcp",
-  version: "1.0.0",
+  name: 'eslint-typescript-mcp',
+  version: VERSION,
 });
 
-log("Initializing ESLint/TypeScript MCP server...");
+logger.info(`Initializing eslint-typescript-mcp v${VERSION}`);
 
-// ============================================================================
-// Tool Schemas
-// ============================================================================
+const READ_ONLY_ANNOTATIONS = {
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false,
+} as const;
 
-const LintInputSchema = z.object({
-  cwd: z
-    .string()
-    .optional()
-    .default(WORKING_DIR)
-    .describe("Working directory for ESLint (defaults to current directory)"),
-});
+const WRITE_ANNOTATIONS = {
+  readOnlyHint: false,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false,
+} as const;
 
-const FixInputSchema = z.object({
-  cwd: z
-    .string()
-    .optional()
-    .default(WORKING_DIR)
-    .describe("Working directory for ESLint (defaults to current directory)"),
-});
-
-const TypecheckInputSchema = z.object({
-  cwd: z
-    .string()
-    .optional()
-    .default(WORKING_DIR)
-    .describe("Working directory for TypeScript (defaults to current directory)"),
-});
-
-const FixAllInputSchema = z.object({
-  cwd: z
-    .string()
-    .optional()
-    .default(WORKING_DIR)
-    .describe("Working directory for all operations (defaults to current directory)"),
-});
-
-// ============================================================================
-// Tool: lint — Run ESLint
-// ============================================================================
+// ---------------------------------------------------------------------------
+// Tool: lint
+// ---------------------------------------------------------------------------
 
 server.registerTool(
-  "lint",
+  'lint',
   {
-    title: "Run ESLint",
-    description: `Run ESLint to find and report code quality issues.
-
-Runs "npx eslint src/ --format json" in the specified directory to analyze JavaScript/TypeScript files.
-
-Returns structured JSON with:
-- success: boolean indicating if linting completed without errors
-- errors: array of error/warning messages found
-- stdout: full ESLint JSON output
-- stderr: any error output from ESLint
-- exitCode: the process exit code (0=no errors, 1=has errors)
-- duration: time taken in milliseconds
-
-Use this to:
-- Check for linting errors before commits
-- Identify code quality issues
-- Audit existing code for problems`,
+    title: 'Run ESLint',
+    description: [
+      'Run ESLint to find and report code quality issues across the requested scope.',
+      '',
+      'Use this to:',
+      '- Check for linting errors before commits',
+      '- Audit existing code for problems',
+      '- Get a structured per-file view that survives parallel agent review',
+      '',
+      'Set `files` to scope to a specific file set (useful when multiple agents work in parallel).',
+      'Set `format: "full"` to see clean files too; the default "compact" omits them.',
+      '',
+      SECURITY_NOTE,
+    ].join('\n'),
     inputSchema: LintInputSchema,
-    annotations: {
-      readOnlyHint: true,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: false,
-    },
+    outputSchema: ToolResultSchema,
+    annotations: READ_ONLY_ANNOTATIONS,
   },
-  async (params: z.infer<typeof LintInputSchema>) => {
-    log(`Running ESLint in ${params.cwd}`);
-
-    const result = await runCommand('npx', ['eslint', 'src/', '--format', 'json'], params.cwd);
-
-    const output = {
-      tool: "lint",
-      command: "npx eslint src/ --format json",
-      workingDirectory: params.cwd,
-      ...result,
-    };
-
-    log(`Lint result: success=${result.success}, exitCode=${result.exitCode}, errorCount=${result.errors.length}`);
-
-    return {
-      content: [{ type: "text", text: JSON.stringify(output, null, 2) }],
-      structuredContent: output,
-    };
-  }
+  async (input: BaseToolInput) =>
+    safeRun({
+      tool: 'lint',
+      input,
+      run: async (cwd, files) => {
+        const ran = await runEslint({ cwd, files, fix: false });
+        return {
+          tool: 'lint',
+          success: !ran.fatal,
+          workingDirectory: cwd,
+          files: pickFiles(ran.files, input.format),
+          summary: summarize(ran.files, {
+            dryRun: false,
+            scope: files ? 'filtered' : 'full',
+            durationMs: ran.durationMs,
+            fixedFiles: 0,
+          }),
+          note: SECURITY_NOTE,
+        };
+      },
+    }),
 );
 
-// ============================================================================
-// Tool: lint_fix — Run ESLint with --fix
-// ============================================================================
+// ---------------------------------------------------------------------------
+// Tool: lint_fix
+// ---------------------------------------------------------------------------
 
 server.registerTool(
-  "lint_fix",
+  'lint_fix',
   {
-    title: "Fix ESLint Errors",
-    description: `Run ESLint with automatic fixes to resolve code quality issues.
-
-Runs "npx eslint src/ --fix --format json" to automatically fix fixable issues like:
-- Formatting problems
-- Missing semicolons
-- Unused variables (with underscore prefix)
-- Import sorting
-- And other auto-fixable issues
-
-Note: Some errors require manual intervention.
-
-Returns structured JSON with:
-- success: boolean indicating if fixing completed (exitCode 0)
-- errors: any remaining errors that could not be auto-fixed
-- stdout: ESLint JSON output showing what was fixed
-- stderr: any error output
-- exitCode: the process exit code
-- duration: time taken in milliseconds`,
-    inputSchema: FixInputSchema,
-    annotations: {
-      readOnlyHint: false,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: false,
-    },
+    title: 'Fix ESLint Errors',
+    description: [
+      'Run ESLint with auto-fix. With `dryRun: true`, fixes are computed but not written.',
+      '',
+      'Status meanings:',
+      '- "fixed": file was modified and is now clean',
+      '- "would-fix": dry-run detected fixes that would be applied',
+      '- "fixable": file still has problems after fix; some remain manual',
+      '- "unfixable": no auto-fixable problems',
+      '',
+      'Per-file targeting via `files` lets multiple agents fix disjoint sets without clobbering each other.',
+      '',
+      SECURITY_NOTE,
+    ].join('\n'),
+    inputSchema: LintFixInputSchema,
+    outputSchema: ToolResultSchema,
+    annotations: WRITE_ANNOTATIONS,
   },
-  async (params: z.infer<typeof FixInputSchema>) => {
-    log(`Running ESLint with --fix in ${params.cwd}`);
-
-    const result = await runCommand('npx', ['eslint', 'src/', '--fix', '--format', 'json'], params.cwd);
-
-    const output = {
-      tool: "lint_fix",
-      command: "npx eslint src/ --fix",
-      workingDirectory: params.cwd,
-      lintFixed: result.exitCode === 0,
-      ...result,
-    };
-
-    return {
-      content: [{ type: "text", text: JSON.stringify(output, null, 2) }],
-      structuredContent: output,
-    };
-  }
+  async (input: BaseToolInput & { dryRun?: boolean }) =>
+    safeRun({
+      tool: 'lint_fix',
+      input,
+      run: async (cwd, files) => {
+        const dryRun = input.dryRun === true;
+        const ran = await runEslint({ cwd, files, fix: true, dryRun });
+        const fixedFiles = dryRun ? 0 : countFixedFiles(ran.files);
+        return {
+          tool: 'lint_fix',
+          success: !ran.fatal,
+          workingDirectory: cwd,
+          files: pickFiles(ran.files, input.format),
+          summary: summarize(ran.files, {
+            dryRun,
+            scope: files ? 'filtered' : 'full',
+            durationMs: ran.durationMs,
+            fixedFiles,
+          }),
+          note: SECURITY_NOTE,
+        };
+      },
+    }),
 );
 
-// ============================================================================
-// Tool: typecheck — Run TypeScript type checking
-// ============================================================================
+// ---------------------------------------------------------------------------
+// Tool: typecheck
+// ---------------------------------------------------------------------------
 
 server.registerTool(
-  "typecheck",
+  'typecheck',
   {
-    title: "Run TypeScript Type Check",
-    description: `Run TypeScript compiler to check for type errors.
-
-Runs "npx tsc --noEmit" to type-check TypeScript files without generating output.
-
-Returns structured JSON with:
-- success: boolean indicating no type errors were found
-- errors: array of type error messages
-- stdout: TypeScript compiler output
-- stderr: any error output from tsc
-- exitCode: the process exit code
-- duration: time taken in milliseconds
-
-Use this to:
-- Verify type correctness before commits
-- Find type errors in TypeScript code
-- Validate type definitions`,
+    title: 'Run TypeScript Type Check',
+    description: [
+      'Run `tsc --noEmit` to validate TypeScript types.',
+      '',
+      'When `files` is provided, the result is filtered to that file set. Note that tsc',
+      'still compiles the whole project for type correctness; the filter only controls',
+      'which diagnostics are surfaced. The `summary.scope` field reflects this.',
+      '',
+      SECURITY_NOTE,
+    ].join('\n'),
     inputSchema: TypecheckInputSchema,
-    annotations: {
-      readOnlyHint: true,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: false,
-    },
+    outputSchema: ToolResultSchema,
+    annotations: READ_ONLY_ANNOTATIONS,
   },
-  async (params: z.infer<typeof TypecheckInputSchema>) => {
-    log(`Running TypeScript type check in ${params.cwd}`);
-
-    const result = await runCommand('npx', ['tsc', '--noEmit'], params.cwd);
-
-    const output = {
-      tool: "typecheck",
-      command: "npx tsc --noEmit",
-      workingDirectory: params.cwd,
-      ...result,
-    };
-
-    return {
-      content: [{ type: "text", text: JSON.stringify(output, null, 2) }],
-      structuredContent: output,
-    };
-  }
+  async (input: BaseToolInput) =>
+    safeRun({
+      tool: 'typecheck',
+      input,
+      run: async (cwd, files) => {
+        const ran = await runTsc({ cwd, files });
+        return {
+          tool: 'typecheck',
+          success: ran.exitCode === 0,
+          workingDirectory: cwd,
+          files: pickFiles(ran.files, input.format),
+          summary: summarize(ran.files, {
+            dryRun: false,
+            scope: files ? 'filtered' : 'full',
+            durationMs: ran.durationMs,
+            fixedFiles: 0,
+          }),
+          note: SECURITY_NOTE,
+        };
+      },
+    }),
 );
 
-// ============================================================================
-// Tool: fix_all — Run lint_fix then typecheck sequentially
-// ============================================================================
+// ---------------------------------------------------------------------------
+// Tool: fix_all
+// ---------------------------------------------------------------------------
 
 server.registerTool(
-  "fix_all",
+  'fix_all',
   {
-    title: "Fix ESLint and TypeScript Errors",
-    description: `Run ESLint fix and TypeScript type check sequentially.
-
-First runs "npx eslint src/ --fix" to auto-fix linting issues, then runs "npx tsc --noEmit" to check types.
-
-This is a convenience tool that combines lint_fix and typecheck in one call.
-The sequential execution ensures:
-1. All auto-fixable linting issues are resolved
-2. TypeScript type errors are then identified
-
-Returns structured JSON with:
-- lintResult: result from ESLint fix
-- typecheckResult: result from TypeScript check
-- totalDuration: combined time for both operations`,
+    title: 'Fix ESLint and TypeScript Errors',
+    description: [
+      'Run ESLint --fix followed by TypeScript type-checking, in one call.',
+      '',
+      'The sequential order means lint fixes land before type checking, so type',
+      'errors introduced or exposed by the fix are reported in the same result.',
+      '',
+      'Set `dryRun: true` to preview lint fixes without writing them; the typecheck',
+      'still runs against the on-disk source.',
+      '',
+      'Set `skipTypecheck: true` to run lint_fix only.',
+      '',
+      'For multi-agent workflows, partition files via `files` so each agent owns a',
+      'disjoint set — this is the primary mechanism for parallel review without races.',
+      '',
+      SECURITY_NOTE,
+    ].join('\n'),
     inputSchema: FixAllInputSchema,
-    annotations: {
-      readOnlyHint: false,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: false,
-    },
+    outputSchema: ToolResultSchema,
+    annotations: WRITE_ANNOTATIONS,
   },
-  async (params: z.infer<typeof FixAllInputSchema>) => {
-    log(`Running fix_all in ${params.cwd}`);
+  async (input: BaseToolInput & { dryRun?: boolean; skipTypecheck?: boolean }) =>
+    safeRun({
+      tool: 'fix_all',
+      input,
+      run: async (cwd, files) => {
+        const start = Date.now();
+        const dryRun = input.dryRun === true;
 
-    // Step 1: Run ESLint fix
-    const startTime = Date.now();
-    const lintResult = await runCommand('npx', ['eslint', 'src/', '--fix', '--format', 'json'], params.cwd);
+        const eslintResult = await runEslint({ cwd, files, fix: true, dryRun });
+        const fixedFiles = dryRun ? 0 : countFixedFiles(eslintResult.files);
 
-    // Step 2: Run TypeScript type check
-    const typecheckResult = await runCommand('npx', ['tsc', '--noEmit'], params.cwd);
+        let tscFiles: FileDiagnostic[] = [];
+        let tscOk = true;
+        let tscDurationMs = 0;
+        if (input.skipTypecheck !== true) {
+          const tscResult = await runTsc({ cwd, files });
+          tscFiles = tscResult.files;
+          tscOk = tscResult.exitCode === 0;
+          tscDurationMs = tscResult.durationMs;
+        }
 
-    const totalDuration = Date.now() - startTime;
+        const totalDurationMs = Date.now() - start;
+        const mergedFiles = mergeFiles(eslintResult.files, tscFiles);
 
-    const output = {
-      tool: "fix_all",
-      commands: ["npx eslint src/ --fix", "npx tsc --noEmit"],
-      workingDirectory: params.cwd,
-      lintResult: {
-        success: lintResult.exitCode === 0,
-        errors: lintResult.errors,
-        stdout: lintResult.stdout,
-        stderr: lintResult.stderr,
-        exitCode: lintResult.exitCode,
-        duration: lintResult.duration,
-        lintFixed: lintResult.exitCode === 0,
+        return {
+          tool: 'fix_all',
+          success: !eslintResult.fatal && tscOk,
+          workingDirectory: cwd,
+          files: pickFiles(mergedFiles, input.format),
+          summary: summarize(mergedFiles, {
+            dryRun,
+            scope: files ? 'filtered' : 'full',
+            durationMs: totalDurationMs,
+            fixedFiles,
+          }),
+          note: [
+            SECURITY_NOTE,
+            `Lint duration: ${eslintResult.durationMs}ms; typecheck duration: ${tscDurationMs}ms.`,
+          ].join(' '),
+        };
       },
-      typecheckResult: {
-        success: typecheckResult.exitCode === 0,
-        errors: typecheckResult.errors,
-        stdout: typecheckResult.stdout,
-        stderr: typecheckResult.stderr,
-        exitCode: typecheckResult.exitCode,
-        duration: typecheckResult.duration,
-      },
-      totalDuration,
-      summary: {
-        lintFixed: lintResult.exitCode === 0,
-        typecheckPassed: typecheckResult.exitCode === 0,
-        hasErrors: lintResult.exitCode !== 0 || typecheckResult.exitCode !== 0,
-      },
-    };
-
-    return {
-      content: [{ type: "text", text: JSON.stringify(output, null, 2) }],
-      structuredContent: output,
-    };
-  }
+    }),
 );
 
-// ============================================================================
-// Main — Connect and Run
-// ============================================================================
+/**
+ * Merge ESLint and tsc diagnostics per file. When both engines report on the
+ * same file, ESLint messages are listed first and tsc messages appended.
+ */
+function mergeFiles(eslintFiles: FileDiagnostic[], tscFiles: FileDiagnostic[]): FileDiagnostic[] {
+  const byFile = new Map<string, FileDiagnostic>();
+  for (const f of eslintFiles) byFile.set(f.file, { ...f, messages: [...f.messages] });
+  for (const tsc of tscFiles) {
+    const existing = byFile.get(tsc.file);
+    if (existing) {
+      existing.messages.push(...tsc.messages);
+      existing.errorCount += tsc.errorCount;
+      existing.warningCount += tsc.warningCount;
+      if (tsc.errorCount > 0 && existing.status === 'clean') {
+        existing.status = 'unfixable';
+      }
+    } else {
+      byFile.set(tsc.file, { ...tsc, messages: [...tsc.messages] });
+    }
+  }
+  return [...byFile.values()];
+}
+
+// ---------------------------------------------------------------------------
+// Bootstrap
+// ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
+  process.on('unhandledRejection', (reason) => {
+    logger.error(
+      `Unhandled rejection: ${reason instanceof Error ? reason.message : String(reason)}`,
+    );
+  });
+
   try {
     const transport = new StdioServerTransport();
     await server.connect(transport);
-    log("MCP server connected via stdio");
+    logger.info('MCP server connected via stdio');
   } catch (error) {
-    log(`Failed to start server: ${error instanceof Error ? error.message : String(error)}`);
+    logger.error(
+      `Failed to start server: ${error instanceof Error ? error.message : String(error)}`,
+    );
     process.exit(1);
   }
 }
