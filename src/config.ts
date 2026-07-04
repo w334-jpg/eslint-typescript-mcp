@@ -6,7 +6,7 @@
  */
 
 /** Server version. Must stay in sync with package.json. */
-export const VERSION = '1.1.0';
+export const VERSION = '1.2.0';
 
 /** Default ESLint target when the caller does not pass `files`. */
 export const DEFAULT_LINT_TARGETS: readonly string[] = ['src/'];
@@ -22,6 +22,48 @@ export const MAX_STDERR_BYTES = 10_000;
 
 /** execa maxBuffer (10 MB) — guards against pathological output. */
 export const CHILD_MAX_BUFFER_BYTES = 10 * 1024 * 1024;
+
+// ---------------------------------------------------------------------------
+// Transaction layer (1.2.0+) — lock, snapshot, audit
+// ---------------------------------------------------------------------------
+
+/** Directory name (under cwd) holding snapshots, locks, and the audit log. */
+export const CACHE_DIR_NAME = '.mcp-cache';
+
+/** Lock staleness threshold (ms). A lock older than this is treated as abandoned. */
+export const LOCK_STALE_MS = 60_000;
+
+/** Lock holder heartbeat interval (ms). 12x under the macOS 1s utimes precision risk. */
+export const LOCK_UPDATE_MS = 5_000;
+
+/** Retry strategy for a contested lock (exponential backoff, ~5 attempts). */
+export const LOCK_RETRIES = { retries: 5, minTimeout: 100, maxTimeout: 2_000 };
+
+/** File extensions snapshotted when no explicit `files` are passed. */
+export const SNAPSHOT_EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'] as readonly string[];
+
+/** Directories skipped during snapshot expansion. */
+export const SNAPSHOT_SKIP_DIRS = [
+  'node_modules',
+  'dist',
+  'build',
+  'coverage',
+  CACHE_DIR_NAME,
+  '.git',
+] as readonly string[];
+
+function readBytesEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+/** Max total bytes captured per snapshot before degradation kicks in. */
+export const SNAPSHOT_MAX_BYTES = readBytesEnv('ESLINT_MCP_SNAPSHOT_MAX_BYTES', 50 * 1024 * 1024);
+
+/** Max audit log size (bytes) before rotation to a sidecar file. */
+export const AUDIT_MAX_BYTES = readBytesEnv('ESLINT_MCP_AUDIT_MAX_BYTES', 10 * 1024 * 1024);
 
 /**
  * Root directories the server is allowed to operate in.

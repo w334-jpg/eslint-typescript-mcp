@@ -53,6 +53,9 @@ web_modules/
 # Optional eslint cache
 .eslintcache
 
+# MCP server runtime cache (snapshots, locks, audit log)
+.mcp-cache/
+
 # Optional stylelint cache
 .stylelintcache
 

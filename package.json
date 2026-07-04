@@ -1,6 +1,6 @@
 {
   "name": "eslint-typescript-mcp",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "MCP server that brings ESLint and TypeScript type-checking diagnostics to Claude Code — enables LLMs to lint, fix, and type-check code automatically, with per-file targeting and dry-run support for multi-agent workflows",
   "keywords": [
     "mcp",
@@ -59,11 +59,13 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.6.1",
     "execa": "^9.6.1",
+    "proper-lockfile": "^4.1.2",
     "zod": "^3.23.8"
   },
   "devDependencies": {
     "@eslint/js": "^9.0.0",
     "@types/node": "^22.10.0",
+    "@types/proper-lockfile": "^4.1.4",
     "@vitest/coverage-v8": "^2.1.0",
     "eslint": "^9.0.0",
     "globals": "^15.0.0",

@@ -4,6 +4,62 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-07-04
+
+### Added
+
+- **Atomic fix transactions.** `lint_fix` and `fix_all` now run as
+  serializable transactions: cross-process per-cwd lock, pre-fix snapshot of
+  the `src/` tree, automatic rollback on verification failure, and a JSONL
+  audit log. Driven by the new `src/transaction.ts` orchestrator.
+- **Cross-process locking** via `proper-lockfile`, scoped per-cwd so
+  concurrent transactions on the same working directory serialize cleanly
+  even across separate MCP server processes.
+- **Snapshot + restore** under `.mcp-cache/snapshots/<runId>/` with
+  content-addressed blobs and a manifest, sized via
+  `ESLINT_MCP_SNAPSHOT_MAX_BYTES` (default 50 MB; degrades gracefully to
+  `commit-no-snapshot` when exceeded).
+- **`rollback` tool** to restore files from prior committed transactions,
+  identified by audit entries (`count` or `since` filter).
+- **`audit_log` tool** to read the JSONL audit trail with `tool`, `since`,
+  and `result` filters.
+- **Audit rotation** at `ESLINT_MCP_AUDIT_MAX_BYTES` (default 10 MB) to
+  sidecar files `audit.jsonl.<ts>.jsonl`.
+- New `verify` and `autoRollback` parameters on `lint_fix` and `fix_all`.
+  `autoRollback` defaults to **true** — tsc verification failure reverts
+  every written file before the lock is released.
+- New modules: `cache-dir.ts`, `lock.ts`, `snapshot.ts`, `audit.ts`,
+  `transaction.ts`, `rollback.ts`.
+
+### Changed
+
+- `src/index.ts` registers six tools (was four) and delegates every fix to
+  `runFixTransaction`. `mergeFiles` moved into `transaction.ts`.
+- README gains a `## Concurrency and recovery` section; CONTRIBUTING
+  architecture diagram and invariants updated; the load-bearing invariant
+  is "fixing handlers never call `runEslint({fix:true})` directly".
+- `.gitignore` excludes `.mcp-cache/`.
+
+### Security
+
+- README "Security" section documents that `.mcp-cache/` contains source
+  copies (snapshots + audit), so it must be treated as a sensitive artifact
+  in CI and cleaned after each run.
+- Every result still carries the `note` reminding consumers that diagnostic
+  text is untrusted data.
+- Lock staleness (60s) and heartbeat (5s) bound the window in which a
+  crashed transaction can block its cwd.
+
+### Notes
+
+- The transaction model is logical serializable isolation, not physical
+  git worktrees — worktrees do not compose with MCP stdio (the agent reads
+  from its cwd; a worktree fix would be invisible until merged back, and
+  merge-back just relocates the race).
+- `autoRollback: true` is the new default. Clients that preferred the 1.1.0
+  "leave the fix on disk even when tsc fails" behavior can pass
+  `autoRollback: false` explicitly.
+
 ## [1.1.0] - 2026-07-04
 
 ### Added

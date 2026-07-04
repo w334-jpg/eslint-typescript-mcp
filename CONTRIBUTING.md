@@ -43,20 +43,26 @@ isolation.
 
 ```
 src/
-  config.ts          constants, version, allow-root env reader
+  config.ts          constants, version, allow-root + cache env readers
   types.ts           shared domain types (no runtime)
   logger.ts          leveled stderr logger
   paths.ts           cwd/files allowlist enforcement
   schemas.ts         Zod input + output schemas (single source of truth)
   run-command.ts     execa wrapper, normalized CommandResult
   result.ts          ToolResult builders, summary, security note
+  cache-dir.ts       .mcp-cache path resolution + idempotent creation
+  lock.ts            proper-lockfile wrapper, per-cwd cross-process lock
+  snapshot.ts        content-addressed snapshot + restore
+  audit.ts           JSONL audit log with rotation
+  transaction.ts     runFixTransaction(): lock -> snapshot -> fix -> verify -> commit/rollback
+  rollback.ts        runRollbackTransaction(): replay snapshots per audit
   parsers/
     eslint.ts        ESLint JSON -> domain types
     tsc.ts           tsc text output -> domain types
   engines/
     eslint.ts        runEslint(): builds args, calls run-command, parses
     tsc.ts           runTsc(): runs tsc, filters by files
-  index.ts           MCP server entry; registers the four tools
+  index.ts           MCP server entry; registers the six tools
 ```
 
 Key invariants:
@@ -65,6 +71,10 @@ Key invariants:
   `run-command.ts`, which is the only module that touches `execa`.
 - **Engines never construct domain types from raw strings.** They delegate
   parsing to `parsers/`, which is pure and unit-tested.
+- **Fixing handlers never call `runEslint({fix:true})` directly.** They go
+  through `runFixTransaction`, which acquires the per-cwd lock, snapshots,
+  runs the fix, verifies, and commits or rolls back atomically. This is the
+  only path that ever mutates source files.
 - **Tool handlers never validate `cwd` themselves.** They go through
   `safeRun`, which calls `paths.ts` and produces an `isError: true` MCP
   response on policy violations.

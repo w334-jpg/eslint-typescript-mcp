@@ -51,6 +51,22 @@ const skipTypecheckField = z
     'fix_all only. Skip the TypeScript typecheck step after running ESLint --fix.',
   );
 
+const verifyField = z
+  .boolean()
+  .optional()
+  .describe(
+    'Run `tsc --noEmit` after the fix. lint_fix defaults to false; fix_all defaults to true ' +
+      '(set skipTypecheck to opt out). When tsc fails and autoRollback is on, the fix is reverted.',
+  );
+
+const autoRollbackField = z
+  .boolean()
+  .optional()
+  .describe(
+    'Roll the transaction back when tsc verification fails (default true). ' +
+      'On rollback, all files are restored to their pre-fix snapshot and the result is returned with isError semantics.',
+  );
+
 // ---------------------------------------------------------------------------
 // Tool input schemas
 // ---------------------------------------------------------------------------
@@ -65,6 +81,8 @@ export const LintFixInputSchema = z.object({
   cwd: cwdField,
   files: filesField,
   dryRun: dryRunField,
+  verify: verifyField,
+  autoRollback: autoRollbackField,
   format: formatField,
 });
 
@@ -78,8 +96,57 @@ export const FixAllInputSchema = z.object({
   cwd: cwdField,
   files: filesField,
   dryRun: dryRunField,
+  verify: verifyField,
+  autoRollback: autoRollbackField,
   format: formatField,
   skipTypecheck: skipTypecheckField,
+});
+
+export const RollbackInputSchema = z.object({
+  cwd: cwdField,
+  count: z
+    .number()
+    .int()
+    .positive()
+    .max(20)
+    .optional()
+    .describe('Roll back the last N committed transactions (default 1, max 20).'),
+  since: z
+    .string()
+    .datetime()
+    .optional()
+    .describe('Alternative to count: roll back every commit since this ISO 8601 timestamp.'),
+});
+
+export const AuditLogInputSchema = z.object({
+  cwd: cwdField,
+  limit: z
+    .number()
+    .int()
+    .positive()
+    .max(500)
+    .optional()
+    .describe('Maximum number of entries to return (default 50, max 500).'),
+  tool: z
+    .enum(['lint_fix', 'fix_all', 'rollback'])
+    .optional()
+    .describe('Filter to entries produced by a specific tool.'),
+  since: z
+    .string()
+    .datetime()
+    .optional()
+    .describe('Filter to entries at or after this ISO 8601 timestamp.'),
+  result: z
+    .enum([
+      'commit',
+      'rollback',
+      'error',
+      'locked-out',
+      'commit-partial-snapshot',
+      'commit-no-snapshot',
+    ])
+    .optional()
+    .describe('Filter to entries with a specific outcome.'),
 });
 
 // ---------------------------------------------------------------------------

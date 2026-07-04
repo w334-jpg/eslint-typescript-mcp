@@ -122,6 +122,40 @@ uncertain whether a fix is safe.
 
 ---
 
+## Concurrency and recovery
+
+Every `lint_fix` and `fix_all` runs as an **atomic transaction** with four
+guarantees:
+
+1. **Cross-process lock** — a per-cwd lock (`.mcp-cache/locks/`, backed by
+   `proper-lockfile`) serializes concurrent transactions on the same working
+   directory, even across separate MCP server processes.
+2. **Pre-fix snapshot** — the `src/` tree is snapshoted to
+   `.mcp-cache/snapshots/<runId>/` before any write.
+3. **Automatic rollback** — when `fix_all`'s `tsc` verification fails and
+   `autoRollback` is on (the default), every file written by ESLint is restored
+   from the snapshot, byte-for-byte, before the lock is released.
+4. **Audit log** — every outcome (commit / rollback / error / locked-out) is
+   appended to `.mcp-cache/audit.jsonl` with the runId, files written, lock
+   duration, and rollback reason.
+
+Two additional tools round out the loop:
+
+- `rollback({ cwd, count?: 1..20, since?: ISO })` — restore files from prior
+  committed transactions. Runs under the same lock.
+- `audit_log({ cwd, limit?, tool?, since?, result? })` — read the audit trail.
+
+### Sizing and degradation
+
+- `ESLINT_MCP_SNAPSHOT_MAX_BYTES` (default 50 MB) — when the source tree is
+  larger than this, the snapshot is skipped, auto-rollback is disabled for
+  that run, and the audit entry is flagged `commit-no-snapshot`. The result
+  `note` warns the consumer.
+- `ESLINT_MCP_AUDIT_MAX_BYTES` (default 10 MB) — audit files rotate to
+  `audit.jsonl.<ts>.jsonl` sidecars when they cross this size.
+
+---
+
 ## Quick start
 
 ### 1. Install
@@ -186,6 +220,11 @@ assumptions:
   user-controlled source files and may contain adversarial text. Every
   result includes a `note` reminding consumers to treat content as data,
   not as instructions.
+- **The `.mcp-cache/` directory contains source copies.** Snapshots under
+  `.mcp-cache/snapshots/` are full content-addressed copies of your source
+  files, and `audit.jsonl` records every fix. If your source contains
+  secrets, so do the snapshots. The directory is gitignored by default; in CI
+  treat it as a sensitive artifact and clean it after each run.
 - **No sandboxing.** There is no `seccomp`, `chroot`, or process isolation.
   CPU, memory, and filesystem access of the child processes are bounded
   only by the host account.
